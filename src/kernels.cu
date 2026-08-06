@@ -126,9 +126,6 @@ void rmsNorm(
 // *********************************************************************
 // flashAttention
 // ********************************************************************
-// =======================================================
-// Tensor layout
-// =======================================================
 
 // 0: [Batch, SeqLen, Heads, HeadDim]
 // 1: [Batch, Heads, SeqLen, HeadDim]
@@ -166,16 +163,6 @@ __global__ void flashAttentionKernel(
     bool is_causal
 )
 {
-    /*
-      与 tester 参考核 ref_flash_attention_kernel 的计算顺序逐位对齐：
-      - 一个线程处理一个 query（grid 在 query 维度并行，blockDim 内每线程一个 query）；
-      - 点积为单线程顺序 FMA（d=0,1,2,...），与参考的 fma.rn.f32 求和顺序一致；
-      - 三遍结构：① global_max  ② sum=Σexp(score·scale-max)  ③ O[d]+=((1/sum)·prob)·V；
-      - scale=rcp(sqrt(head_dim))、1/sum=rcp(sum)、exp 用 expf，均与参考同指令。
-
-      参考核是单精度 float（PTX 全程 f32、无 f64），故这里也用 float。若用 double 或
-      warp-shuffle 并行点积/两遍结构，舍入顺序与参考不一致，会在 float 用例的紧容差上越界。
-    */
 
     int total = batch_size * target_seq_len * query_heads;
     int gtid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -332,7 +319,6 @@ void flashAttention(
     cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice);
 
     // 一个线程处理一个 query：grid 在 query 维度并行，无需 shared memory
-    // （Q/O 缓冲放在每线程 local memory，与参考核一致）。
     int total = batch_size * target_seq_len * query_heads;
 
     dim3 block(256);
