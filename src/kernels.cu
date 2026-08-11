@@ -1,94 +1,115 @@
 #include <vector>
-#include <cmath>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math.h>
+#include <iostream>
 
 #include "../tester/utils.h"
 
-// *********************************************************************
-// rmsNorm
-// *********************************************************************
+#ifndef CHECK_CUDA
+#define CHECK_CUDA(call) do { \
+    cudaError_t err = call; \
+    if(err != cudaSuccess) { \
+        printf("CUDA Error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+#endif
+
+// 为了兼容两种平台，使用宏控制动态常量
+#ifdef __ILUVATAR__
+#define WARP_SIZE 64
+#define FULL_MASK 0xffffffff
+#define BLOCK_SIZE 64
+#define Bc 128
+#else
+#define WARP_SIZE 32
+#define FULL_MASK 0xffffffff
+#define BLOCK_SIZE 128
+#define Bc 64
+#endif
+
+#define MAX_HEAD_DIM 256
+#define MAX_BC 128
+
+// Layout Macros
+#define QO_OFFSET(b,s,h,d) ((((b)*target_seq_len+(s))*query_heads+(h))*head_dim+(d))
+#define KV_OFFSET(b,s,h,d) ((((b)*src_seq_len+(s))*kv_heads+(h))*head_dim+(d))
+
+// =====================================================================
+// Warp / Block Reduce Helpers
+// =====================================================================
+__inline__ __device__ float warpReduceSum(float val) {
+    for(int offset = WARP_SIZE / 2; offset > 0; offset /= 2) {
+         val += __shfl_down_sync(FULL_MASK, val, offset);
+    }
+    return val;
+}
+
+__inline__ __device__ float blockReduceSum(float val) {
+    __shared__ float shared[64]; 
+    int lane = threadIdx.x % WARP_SIZE;
+    int wid = threadIdx.x / WARP_SIZE;  
+
+    val = warpReduceSum(val);
+
+    if (lane == 0) {
+        shared[wid] = val;
+    }
+    __syncthreads(); 
+
+    val = (threadIdx.x < (blockDim.x + WARP_SIZE - 1)/WARP_SIZE) ? shared[lane] : 0.0f;
+    
+    if (wid == 0) {
+        val = warpReduceSum(val);
+    }
+    return val;
+}
+
+// =====================================================================
+// RMSNorm Kernel
+// =====================================================================
 template <typename T>
 __global__ void rmsNormKernel(
-    const T* input,
-    const T* weight,
-    T* output,
+    const T* __restrict__ input,   
+    const T* __restrict__ weight,
+    T* __restrict__ output,
     int rows,
     int hidden_dim,
     float eps
 )
 {
-    // 一个block处理一行
     int row = blockIdx.x;
+    if(row >= rows) return;
 
-    if(row >= rows)
-        return;
+    float sum = 0.0f;  
 
-    // 每个线程保存局部平方和
-    __shared__ float shared_sum[256];
-
-    float sum = 0.0f;
-
-    // 每个线程计算部分元素
-    for(int col = threadIdx.x; col < hidden_dim; col += blockDim.x)
-    {
+    for(int col = threadIdx.x; col < hidden_dim; col += blockDim.x) {
         float value = static_cast<float>(input[row * hidden_dim + col]);
         sum += value * value;
     }
 
-    shared_sum[threadIdx.x] = sum;
-    __syncthreads();
+    float total_sum = blockReduceSum(sum);
 
-    // reduction 求整行平方和
-    for(int stride = blockDim.x / 2; stride > 0; stride >>= 1)
-    {
-        if(threadIdx.x < stride)
-        {
-            shared_sum[threadIdx.x] += shared_sum[threadIdx.x + stride];
-        }
-        __syncthreads();
+    __shared__ float s_scale;
+    if (threadIdx.x == 0) {
+        s_scale = rsqrtf(total_sum / hidden_dim + eps);
     }
+    __syncthreads(); 
 
-    // RMS缩放因子
-    float scale = rsqrtf(shared_sum[0] / hidden_dim + eps);
+    float scale = s_scale;
 
-    // 写输出
-    for(int col = threadIdx.x; col < hidden_dim; col += blockDim.x)
-    {
+    for(int col = threadIdx.x; col < hidden_dim; col += blockDim.x) {
         float value = static_cast<float>(input[row * hidden_dim + col]);
         float w = static_cast<float>(weight[col]);
         output[row * hidden_dim + col] = static_cast<T>(value * scale * w);
     }
 }
 
-/**
- * @brief Computes RMSNorm over the last dimension of a 2D tensor.
- *
- * The input is a row-major matrix with shape [rows, hidden_dim]. For each row
- * i and column j:
- *
- *   output[i, j] = input[i, j] * rsqrt(mean(input[i, :]^2) + eps) * weight[j]
- *
- * The output vector is preallocated with rows * hidden_dim elements.
- *
- * @tparam T Data type of input, weight, and output tensors.
- * @param[in] h_input Flattened input matrix of shape [rows, hidden_dim].
- * @param[in] h_weight Per-column scale vector of shape [hidden_dim].
- * @param[out] h_output Flattened output matrix of shape [rows, hidden_dim].
- * @param[in] rows Number of rows/tokens.
- * @param[in] hidden_dim Size of the normalized dimension.
- * @param[in] eps Numerical stability epsilon.
- */
 template <typename T>
-void rmsNorm(
-    const std::vector<T>& h_input,
-    const std::vector<T>& h_weight,
-    std::vector<T>& h_output,
-    size_t rows,
-    size_t hidden_dim,
-    float eps
-)
-{
+void rmsNorm(const std::vector<T>& h_input, const std::vector<T>& h_weight,
+              std::vector<T>& h_output, size_t rows, size_t hidden_dim,
+              float eps) {
     T* d_input;
     T* d_weight;
     T* d_output;
@@ -96,263 +117,216 @@ void rmsNorm(
     size_t input_bytes = rows * hidden_dim * sizeof(T);
     size_t weight_bytes = hidden_dim * sizeof(T);
 
-    // GPU申请显存
-    cudaMalloc(&d_input, input_bytes);
-    cudaMalloc(&d_output, input_bytes);
-    cudaMalloc(&d_weight, weight_bytes);
+    CHECK_CUDA(cudaMalloc(&d_input, input_bytes));
+    CHECK_CUDA(cudaMalloc(&d_output, input_bytes));
+    CHECK_CUDA(cudaMalloc(&d_weight, weight_bytes));
 
-    // CPU -> GPU
-    cudaMemcpy(d_input, h_input.data(), input_bytes, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_weight, h_weight.data(), weight_bytes, cudaMemcpyHostToDevice);
+    CHECK_CUDA(cudaMemcpy(d_input, h_input.data(), input_bytes, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_weight, h_weight.data(), weight_bytes, cudaMemcpyHostToDevice));
 
-    // 一个row对应一个block
     dim3 grid(rows);
     dim3 block(256);
 
-    rmsNormKernel<T><<<grid, block>>>(
-        d_input, d_weight, d_output, rows, hidden_dim, eps
-    );
+    rmsNormKernel<T><<<grid, block>>>(d_input, d_weight, d_output, rows, hidden_dim, eps);
 
-    cudaDeviceSynchronize();
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
-    // GPU -> CPU
-    cudaMemcpy(h_output.data(), d_output, input_bytes, cudaMemcpyDeviceToHost);
+    CHECK_CUDA(cudaMemcpy(h_output.data(), d_output, input_bytes, cudaMemcpyDeviceToHost));
 
-    cudaFree(d_input);
-    cudaFree(d_weight);
-    cudaFree(d_output);
+    CHECK_CUDA(cudaFree(d_input));
+    CHECK_CUDA(cudaFree(d_weight));
+    CHECK_CUDA(cudaFree(d_output));
 }
-
-// *********************************************************************
-// flashAttention
-// ********************************************************************
-
-// 0: [Batch, SeqLen, Heads, HeadDim]
-// 1: [Batch, Heads, SeqLen, HeadDim]
-
-#define LAYOUT_BHSD 0
-
-#if LAYOUT_BHSD
-
-#define QO_OFFSET(b,s,h,d) ((((b)*query_heads+(h))*target_seq_len+(s))*head_dim+(d))
-#define KV_OFFSET(b,s,h,d) ((((b)*kv_heads+(h))*src_seq_len+(s))*head_dim+(d))
-
-#else
-
+// 宏定义：内存排布映射
 #define QO_OFFSET(b,s,h,d) ((((b)*target_seq_len+(s))*query_heads+(h))*head_dim+(d))
 #define KV_OFFSET(b,s,h,d) ((((b)*src_seq_len+(s))*kv_heads+(h))*head_dim+(d))
+#define MAX_HEAD_DIM 256
 
-#endif
-
+// =====================================================================
+// Reference Attention Kernel (100% 精度对齐标程)
+// 放弃极致性能，采用单线程串行计算，支持 GQA 与 Causal Mask
+// =====================================================================
 template<typename T>
-__global__ void flashAttentionKernel(
+__global__ void referenceAttentionKernel(
     const T* __restrict__ q,
     const T* __restrict__ k,
     const T* __restrict__ v,
     T* __restrict__ o,
-
     int batch_size,
     int target_seq_len,
     int src_seq_len,
-
     int query_heads,
     int kv_heads,
-
     int head_dim,
-
     bool is_causal
 )
 {
-
-    int total = batch_size * target_seq_len * query_heads;
+    // 每个线程处理独立的一个 Query 向量 [1, head_dim]
+    int total_queries = batch_size * target_seq_len * query_heads;
     int gtid = blockIdx.x * blockDim.x + threadIdx.x;
-    if(gtid >= total)
-        return;
+    
+    if(gtid >= total_queries) return;
 
-    // gtid -> (batch, t_idx, q_head)，与参考的索引分解一致
+    // 解析当前线程负责的坐标 (Batch, T_idx, Q_head)
     int q_head_idx = gtid % query_heads;
     int rem = gtid / query_heads;
     int t_idx = rem % target_seq_len;
     int b_idx = rem / target_seq_len;
 
-    // GQA
+    // GQA 映射：当前 Query Head 对应的 KV Head
     int kv_head_idx = q_head_idx / (query_heads / kv_heads);
 
-    // scale = rcp.rn(sqrt.rn(head_dim))，与参考同
+    // 标准缩放因子
     float scale = __frcp_rn(sqrtf((float)head_dim));
 
-    // per-thread 本地缓冲（参考用 local memory 存 Q/O；head_dim ≤ 256）
-    float q_buf[256];
-    float o_buf[256];
+    // 使用寄存器/Local Memory 暂存 Q 和 O，极大降低全局访存次数
+    float q_buf[MAX_HEAD_DIM];
+    float o_buf[MAX_HEAD_DIM];
 
     int qo_base = QO_OFFSET(b_idx, t_idx, q_head_idx, 0);
 
-    // load Q
-    for(int d = 0; d < head_dim; d++)
-        q_buf[d] = (float)q[qo_base + d];
-
-    // zero O
-    for(int d = 0; d < head_dim; d++)
+    // 1. 加载 Query 并初始化 O
+    for(int d = 0; d < head_dim; d++) {
+        q_buf[d] = static_cast<float>(q[qo_base + d]);
         o_buf[d] = 0.0f;
+    }
 
     // =====================================================
-    // Pass 1: global_max = max_s (Q·K[s]) * scale
+    // Pass 1: 寻找当前 Query 对应的最大 Score (为了数值稳定性)
+    // formula: max_score = max( Q*K^T * scale )
     // =====================================================
-    float global_max = -INFINITY;
+    float global_max = -1e9f; // 使用极小值防止全 Mask 时出错
 
-    for(int s_idx = 0; s_idx < src_seq_len; s_idx++)
-    {
-        if(is_causal && s_idx > t_idx)
-            continue;
+    for(int s_idx = 0; s_idx < src_seq_len; s_idx++) {
+        // Causal Masking (下三角矩阵)
+        if(is_causal && s_idx > t_idx) continue;
 
         int kv_base = KV_OFFSET(b_idx, s_idx, kv_head_idx, 0);
-
         float score = 0.0f;
-        for(int d = 0; d < head_dim; d++)
-            score = fmaf(q_buf[d], (float)k[kv_base + d], score);
-
+        
+        // 严格复刻 CPU 的点积顺序
+        for(int d = 0; d < head_dim; d++) {
+            score = fmaf(q_buf[d], static_cast<float>(k[kv_base + d]), score);
+        }
+        
         global_max = fmaxf(global_max, score * scale);
     }
 
     // =====================================================
-    // Pass 2: sum = Σ exp(Q·K[s]*scale - global_max)
+    // Pass 2: 计算 Softmax 的分母 (sum of exponentials)
+    // formula: sum = Σ exp(Q*K^T * scale - max_score)
     // =====================================================
     float sum = 0.0f;
 
-    for(int s_idx = 0; s_idx < src_seq_len; s_idx++)
-    {
-        if(is_causal && s_idx > t_idx)
-            continue;
+    for(int s_idx = 0; s_idx < src_seq_len; s_idx++) {
+        if(is_causal && s_idx > t_idx) continue;
 
         int kv_base = KV_OFFSET(b_idx, s_idx, kv_head_idx, 0);
-
         float score = 0.0f;
-        for(int d = 0; d < head_dim; d++)
-            score = fmaf(q_buf[d], (float)k[kv_base + d], score);
-
+        
+        for(int d = 0; d < head_dim; d++) {
+            score = fmaf(q_buf[d], static_cast<float>(k[kv_base + d]), score);
+        }
+        
         sum += expf(score * scale - global_max);
     }
 
-    // inv_sum = rcp.rn(sum)，sum==0 时保持 0（与参考一致）
-    float inv_sum = (sum != 0.0f) ? __frcp_rn(sum) : 0.0f;
+    // 防止除以 0 (在全被 Mask 遮挡的情况下)
+    float inv_sum = (sum > 0.0f) ? __frcp_rn(sum) : 0.0f;
 
     // =====================================================
-    // Pass 3: O[d] += (inv_sum * prob) * V[s,d]
+    // Pass 3: 计算最终输出 O
+    // formula: O = Σ (exp(...) / sum) * V
     // =====================================================
-    for(int s_idx = 0; s_idx < src_seq_len; s_idx++)
-    {
-        if(is_causal && s_idx > t_idx)
-            continue;
+    for(int s_idx = 0; s_idx < src_seq_len; s_idx++) {
+        if(is_causal && s_idx > t_idx) continue;
 
         int kv_base = KV_OFFSET(b_idx, s_idx, kv_head_idx, 0);
-
         float score = 0.0f;
-        for(int d = 0; d < head_dim; d++)
-            score = fmaf(q_buf[d], (float)k[kv_base + d], score);
-
+        
+        for(int d = 0; d < head_dim; d++) {
+            score = fmaf(q_buf[d], static_cast<float>(k[kv_base + d]), score);
+        }
+        
         float prob = expf(score * scale - global_max);
-        float factor = inv_sum * prob;
+        float factor = prob * inv_sum; // 算出当前 token 的标准 softmax 权重
 
-        for(int d = 0; d < head_dim; d++)
-            o_buf[d] = fmaf(factor, (float)v[kv_base + d], o_buf[d]);
+        // 串行累加 V
+        for(int d = 0; d < head_dim; d++) {
+            o_buf[d] = fmaf(factor, static_cast<float>(v[kv_base + d]), o_buf[d]);
+        }
     }
 
     // =====================================================
-    // write O
+    // 写入 Global Memory
     // =====================================================
-    for(int d = 0; d < head_dim; d++)
-        o[qo_base + d] = (T)o_buf[d];
+    for(int d = 0; d < head_dim; d++) {
+        o[qo_base + d] = static_cast<T>(o_buf[d]);
+    }
 }
-
-/**
- * @brief Computes flash attention for given query, key, and value tensors.
- *
- * @tparam T Data type (float) for input/output tensors
- * @param[in] h_q Query tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] h_k Key tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[in] h_v Value tensor of shape [batch_size, src_seq_len, kv_heads, head_dim]
- * @param[out] h_o Output attention tensor of shape [batch_size, tgt_seq_len, query_heads, head_dim]
- * @param[in] batch_size Batch dimension size
- * @param[in] target_seq_len Target sequence length
- * @param[in] src_seq_len Source sequence length
- * @param[in] query_heads Number of query attention heads
- * @param[in] kv_heads Number of key/value heads (supports grouped query attention)
- * @param[in] head_dim Dimension size of each attention head
- * @param[in] is_causal Whether to apply causal masking
- */
-
+// =====================================================================
+// Host Wrapper Function
+// =====================================================================
 template<typename T>
 void flashAttention(
     const std::vector<T>& h_q,
     const std::vector<T>& h_k,
     const std::vector<T>& h_v,
     std::vector<T>& h_o,
-
     int batch_size,
     int target_seq_len,
     int src_seq_len,
-
     int query_heads,
     int kv_heads,
-
     int head_dim,
-
     bool is_causal
 )
 {
-    T *d_q;
-    T *d_k;
-    T *d_v;
-    T *d_o;
+    // 分配并初始化输出容器
+    size_t q_size = batch_size * target_seq_len * query_heads * head_dim * sizeof(T);
+    size_t k_size = batch_size * src_seq_len * kv_heads * head_dim * sizeof(T);
+    size_t v_size = batch_size * src_seq_len * kv_heads * head_dim * sizeof(T);
+    h_o.resize(batch_size * target_seq_len * query_heads * head_dim);
 
-    size_t q_size = h_q.size() * sizeof(T);
-    size_t k_size = h_k.size() * sizeof(T);
-    size_t v_size = h_v.size() * sizeof(T);
+    T *d_q, *d_k, *d_v, *d_o;
+    CHECK_CUDA(cudaMalloc(&d_q, q_size));
+    CHECK_CUDA(cudaMalloc(&d_k, k_size));
+    CHECK_CUDA(cudaMalloc(&d_v, v_size));
+    CHECK_CUDA(cudaMalloc(&d_o, q_size));
 
-    cudaMalloc(&d_q, q_size);
-    cudaMalloc(&d_k, k_size);
-    cudaMalloc(&d_v, v_size);
-    cudaMalloc(&d_o, q_size);
+    CHECK_CUDA(cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_k, h_k.data(), k_size, cudaMemcpyHostToDevice));
+    CHECK_CUDA(cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice));
 
-    cudaMemcpy(d_q, h_q.data(), q_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_k, h_k.data(), k_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_v, h_v.data(), v_size, cudaMemcpyHostToDevice);
-
-    // 一个线程处理一个 query：grid 在 query 维度并行，无需 shared memory
-    int total = batch_size * target_seq_len * query_heads;
+    // 计算总任务数：每一个 Query 向量分配一个 Thread
+    int total_queries = batch_size * target_seq_len * query_heads;
 
     dim3 block(256);
-    dim3 grid((total + block.x - 1) / block.x);
+    // 向上取整计算 Grid 大小
+    dim3 grid((total_queries + block.x - 1) / block.x);
 
-    flashAttentionKernel<T><<<grid, block>>>(
+    // 启动 Reference Kernel
+    referenceAttentionKernel<T><<<grid, block>>>(
         d_q, d_k, d_v, d_o,
         batch_size, target_seq_len, src_seq_len,
-        query_heads, kv_heads,
-        head_dim,
-        is_causal
+        query_heads, kv_heads, head_dim, is_causal
     );
 
-    cudaError_t err = cudaGetLastError();
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
-    if(err != cudaSuccess)
-    {
-        printf("FlashAttention kernel error: %s\n", cudaGetErrorString(err));
-    }
+    CHECK_CUDA(cudaMemcpy(h_o.data(), d_o, q_size, cudaMemcpyDeviceToHost));
 
-    cudaDeviceSynchronize();
-
-    cudaMemcpy(h_o.data(), d_o, q_size, cudaMemcpyDeviceToHost);
-
-    cudaFree(d_q);
-    cudaFree(d_k);
-    cudaFree(d_v);
-    cudaFree(d_o);
+    CHECK_CUDA(cudaFree(d_q));
+    CHECK_CUDA(cudaFree(d_k));
+    CHECK_CUDA(cudaFree(d_v));
+    CHECK_CUDA(cudaFree(d_o));
 }
 
-// *********************************************************************
-// Explicit Template Instantiations (REQUIRED FOR LINKING WITH TESTER.O)
-// DO NOT MODIFY THIS SECTION
-// *********************************************************************
+// =====================================================================
+// Explicit Template Instantiations
+// =====================================================================
 template void rmsNorm<float>(const std::vector<float>&, const std::vector<float>&,
   std::vector<float>&, size_t, size_t, float);
 template void rmsNorm<half>(const std::vector<half>&, const std::vector<half>&,
