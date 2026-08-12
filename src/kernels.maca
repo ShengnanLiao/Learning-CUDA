@@ -4,7 +4,6 @@
 
 #include "../tester/utils.h"
 
-// 替换为正确的沐曦 mc API
 #ifndef CHECK_MC
 #define CHECK_MC(call) do { \
     mcError_t err = call; \
@@ -15,7 +14,7 @@
 } while(0)
 #endif
 
-// Warp 级别的求和规约 (利用硬件寄存器通信，极快，不需要同步)
+// Warp 级别的求和规约
 __inline__ __device__ float warpReduceSum(float val) {
     for (int offset = 16; offset > 0; offset /= 2) {
         val += __shfl_down_sync(0xffffffff, val, offset);
@@ -25,26 +24,21 @@ __inline__ __device__ float warpReduceSum(float val) {
 
 // Block 级别的求和规约
 __inline__ __device__ float blockReduceSum(float val) {
-    // 假设最大 blockDim.x = 1024，最多 32 个 Warp
     static __shared__ float shared[32]; 
-    int lane = threadIdx.x % 32; // 当前线程在 Warp 中的 ID
-    int wid = threadIdx.x / 32;  // 当前线程所在的 Warp ID
+    int lane = threadIdx.x % 32; 
+    int wid = threadIdx.x / 32;  
 
-    // 1. 每个 Warp 内部先求和
     val = warpReduceSum(val);
 
-    // 2. 将每个 Warp 的和写入共享内存（每个 Warp 只有 lane 0 存有有效完整和）
     if (lane == 0) {
         shared[wid] = val;
     }
-    __syncthreads(); // 等待所有 Warp 写入完毕
+    __syncthreads(); 
 
-    // 3. 将共享内存中的值交给第一个 Warp 再次规约
-    // 如果当前线程所在的 Warp 超出了实际 Warp 数量，则补 0
     val = (threadIdx.x < (blockDim.x / 32)) ? shared[lane] : 0.0f;
     
     if (wid == 0) {
-        val = warpReduceSum(val); // 第一个 Warp 求最终的总和
+        val = warpReduceSum(val); 
     }
 
     return val;
@@ -67,7 +61,6 @@ __global__ void rmsNormKernel(
     if(row >= rows) return;
 
     float sum = 0.0f;
-
     for(int col = threadIdx.x; col < hidden_dim; col += blockDim.x)
     {
         float value = static_cast<float>(input[row * hidden_dim + col]);
@@ -93,9 +86,6 @@ __global__ void rmsNormKernel(
     }
 }
 
-/**
- * @brief Computes RMSNorm over the last dimension of a 2D tensor.
- */
 template <typename T>
 void rmsNorm(
     const std::vector<T>& h_input,
@@ -112,13 +102,12 @@ void rmsNorm(
 
     size_t input_bytes = rows * hidden_dim * sizeof(T);
     size_t weight_bytes = hidden_dim * sizeof(T);
+    h_output.resize(rows * hidden_dim); 
 
-    // 使用 mc API
     CHECK_MC(mcMalloc(&d_input, input_bytes));
     CHECK_MC(mcMalloc(&d_output, input_bytes));
     CHECK_MC(mcMalloc(&d_weight, weight_bytes));
 
-    // CPU -> GPU
     CHECK_MC(mcMemcpy(d_input, h_input.data(), input_bytes, mcMemcpyHostToDevice));
     CHECK_MC(mcMemcpy(d_weight, h_weight.data(), weight_bytes, mcMemcpyHostToDevice));
 
@@ -132,17 +121,15 @@ void rmsNorm(
     CHECK_MC(mcGetLastError());
     CHECK_MC(mcDeviceSynchronize());
 
-    // GPU -> CPU
     CHECK_MC(mcMemcpy(h_output.data(), d_output, input_bytes, mcMemcpyDeviceToHost));
 
-    // 释放显存
     CHECK_MC(mcFree(d_input));
     CHECK_MC(mcFree(d_weight));
     CHECK_MC(mcFree(d_output));
 }
 
 // *********************************************************************
-// flashAttention
+// flashAttention 
 // ********************************************************************
 
 #define LAYOUT_BHSD 0
@@ -184,6 +171,7 @@ __global__ void flashAttentionKernel(
     int t_idx = rem % target_seq_len;
     int b_idx = rem / target_seq_len;
 
+    // GQA 映射
     int kv_head_idx = q_head_idx / (query_heads / kv_heads);
 
     float scale = __frcp_rn(sqrtf((float)head_dim));
@@ -199,7 +187,9 @@ __global__ void flashAttentionKernel(
     for(int d = 0; d < head_dim; d++)
         o_buf[d] = 0.0f;
 
-    // Pass 1
+    // =====================================================
+    // 用 -INFINITY 和 s_idx > t_idx
+    // =====================================================
     float global_max = -INFINITY;
     for(int s_idx = 0; s_idx < src_seq_len; s_idx++)
     {
@@ -215,7 +205,9 @@ __global__ void flashAttentionKernel(
         global_max = fmaxf(global_max, score * scale);
     }
 
-    // Pass 2
+    // =====================================================
+    //  s_idx > t_idx
+    // =====================================================
     float sum = 0.0f;
     for(int s_idx = 0; s_idx < src_seq_len; s_idx++)
     {
@@ -233,7 +225,9 @@ __global__ void flashAttentionKernel(
 
     float inv_sum = (sum != 0.0f) ? __frcp_rn(sum) : 0.0f;
 
-    // Pass 3
+    // =====================================================
+    // 用 s_idx > t_idx
+    // =====================================================
     for(int s_idx = 0; s_idx < src_seq_len; s_idx++)
     {
         if(is_causal && s_idx > t_idx)
@@ -252,13 +246,11 @@ __global__ void flashAttentionKernel(
             o_buf[d] = fmaf(factor, (float)v[kv_base + d], o_buf[d]);
     }
 
+    // Write O
     for(int d = 0; d < head_dim; d++)
         o[qo_base + d] = (T)o_buf[d];
 }
 
-/**
- * @brief Computes flash attention for given query, key, and value tensors.
- */
 template<typename T>
 void flashAttention(
     const std::vector<T>& h_q,
@@ -286,8 +278,8 @@ void flashAttention(
     size_t q_size = h_q.size() * sizeof(T);
     size_t k_size = h_k.size() * sizeof(T);
     size_t v_size = h_v.size() * sizeof(T);
+    h_o.resize(h_q.size());
 
-    // 使用 mc API
     CHECK_MC(mcMalloc(&d_q, q_size));
     CHECK_MC(mcMalloc(&d_k, k_size));
     CHECK_MC(mcMalloc(&d_v, v_size));
